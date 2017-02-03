@@ -1,0 +1,180 @@
+#!/usr/bin/env python
+# -*- Mode: python; tab-width: 4; indent-tabs-mode: nil; coding: utf-8; -*-
+
+import sys
+import subprocess
+from contextlib import suppress
+from itertools import dropwhile
+from types import SimpleNamespace as NS
+from ast import literal_eval
+
+# choose SMART stat value from:
+#  https://www.backblaze.com/blog/what-smart-stats-indicate-hard-drive-failures/
+
+
+def show_uber(n=None):
+    typical = [13, 14, 15, 16] if n is None else [n]
+    print('Uncorrectable Bit Error Rate (UBER):')
+    for n in typical:
+        uber_tb = 10 ** n / 8 / TB
+        print(' 1 bit error per 10E+{} read  =  1 bit error per {:.2f} TiB read'.format(n, uber_tb))
+
+
+def to_attr_key(key):
+    return key.replace(' ', '_').replace('-', '_').lower()
+
+
+def humanbytes(b: int, iec=True) -> str:
+    assert b >= 0
+    thresh = 6
+    base = 1024 if iec else 1000
+    if b < (thresh * base):
+        return str(b) + ' B'
+    elif b < (thresh * base * base):
+        s = '{:.2f} K'.format(b / base)
+    elif b < (thresh * base * base * base):
+        s = '{:.2f} M'.format(b / (base * base))
+    elif b < (thresh * base * base * base * base):
+        s = '{:.2f} G'.format(b / (base * base * base))
+    else:
+        s = '{:.2f} T'.format(b / (base * base * base * base))
+    if iec:
+        return s + 'iB'
+    else:
+        return s + 'B'
+
+
+def attempt_read_info_section(device):
+    info = NS()
+    smartctl = subprocess.run(['smartctl', '-i', device], stdout=subprocess.PIPE, timeout=3)
+    if smartctl.returncode != 0:
+        return None
+    for line in dropwhile(lambda x: not x.startswith('=== START OF INFORMATION SECTION ==='),
+                          smartctl.stdout.decode().split('\n')):
+        if line.startswith('==='):
+            continue
+        if not line:
+            break
+        key, _, value = line.partition(':')
+        setattr(info, to_attr_key(key), value.strip())
+    cap, _, _ = info.user_capacity.partition(' ')
+    info.user_capacity = int(cap.replace(',', ''))
+    with suppress(AttributeError, ValueError):
+        info.rotation_rate = int(info.rotation_rate.replace('rpm', ''))
+    if hasattr(info, 'sector_sizes'):
+        info.sector_size = info.sector_sizes
+        del info.sector_sizes
+    info.logical_sector_size, info.physical_sector_size = {
+        '512 bytes logical/physical': (512, 512),
+        '512 bytes logical, 4096 bytes physical': (512, 4096),
+        '4096 bytes logical/physical': (4096, 4096)
+    }[info.sector_size]
+    return info
+
+
+def attempt_read_data_section(device):
+    data = NS()
+    smartctl = subprocess.run(['smartctl', '-A', device], stdout=subprocess.PIPE, timeout=3)
+    if smartctl.returncode != 0:
+        return None
+    for line in dropwhile(lambda x: not x.startswith('ID# ATTRIBUTE_NAME'),
+                          smartctl.stdout.decode().split('\n')):
+        if line.startswith('ID#'):
+            continue
+        if (not line) or ('||||' in line):
+            break
+        s = line.split()
+        name = s[1]
+        value = ' '.join(s[9:])
+        with suppress(SyntaxError, ValueError):
+            value = literal_eval(' '.join(s[9:]))
+        setattr(data, to_attr_key(name.strip()), value)
+    return data
+
+
+def attempt_read_devstat(device):
+    devstat = NS()
+    smartctl = subprocess.run(['smartctl', '-l', 'devstat', device], stdout=subprocess.PIPE, timeout=3)
+    if smartctl.returncode != 0:
+        return None
+    for line in dropwhile(lambda x: not x.startswith('Device Statistics (GP Log 0x04)'),
+                          smartctl.stdout.decode().split('\n')):
+        if not line.startswith('0x') or '=====' in line:
+            continue
+        if '---' in line:
+            values, _, name = line.partition('---')
+        elif 'N--' in line:
+            values, _, name = line.partition('N--')
+        else:
+            continue
+        try:
+            value = int(values.split()[-1])
+        except ValueError:
+            continue
+        setattr(devstat, to_attr_key(name.strip()), value)
+    if len(vars(devstat)) == 0:
+        return None
+    return devstat
+
+
+def show(info, data, devstat):
+    GB = 1024 * 1024 * 1024
+    TB = GB * 1024
+    if devstat:
+        written = devstat.logical_sectors_written * info.logical_sector_size
+        read = devstat.logical_sectors_read * info.logical_sector_size
+    else:
+        written, read = (None, None)
+    power_on_days = data.power_on_hours / 24
+    power_on_years = data.power_on_hours / (24 * 365)
+    print('Device: {device_model} (FW:{firmware_version}, SN:{serial_number})'.format(**vars(info)))
+    print('Capacity: {} ({})'.format(humanbytes(info.user_capacity), humanbytes(info.user_capacity, False)))
+    print('Power On: {:.2f} years ({} hours, {:.1f} days, power cycle {})'.format(
+        power_on_years, data.power_on_hours, power_on_days, data.power_cycle_count))
+    print('SMART:')
+
+    def out(attr_n, name, attr):
+        with suppress(AttributeError):
+            print('  {:3d}: {:30s}: {}'.format(attr_n, name, getattr(data, attr)))
+
+    out(5, 'Reallocated Sectors Count', 'reallocated_sector_ct')
+    out(187, 'Reported Uncorrectable Errors', 'reported_uncorrect')
+    out(188, 'Command Timeout', 'command_timeout')
+    out(197, 'Current Pending Sector Count', 'current_pending_sector')
+    out(198, 'Uncorrectable Sector Count', 'offline_uncorrectable')
+    if devstat:
+        print('Device stat:')
+        print('  Write: {} ({:.2f} drive write)'.format(humanbytes(written), written / info.user_capacity))
+        print('  Read:  {}'.format(humanbytes(read)))
+        print('  Read/Write Ratio: {:.2f}'.format(read / written))
+        print('  Write per Year: {:.2f} TiB/year'.format(written / TB / power_on_years))
+        print('  Write per Day: {:.2f} GiB/day ({:.3f} DWPD)'.format(
+            written / GB / power_on_days,
+            written / power_on_days / info.user_capacity))
+        print('  Read per Year: {:.2f} TiB/year'.format(read / TB / power_on_years))
+        print('  Read per Day: {:.2f} GiB/day'.format(read / GB / (power_on_years * 365)))
+        with suppress(AttributeError):
+            print('  Read Recovery: {} corrected, {} uncorrect'.format(devstat.read_recovery_attempts,
+                                                                       devstat.number_of_reported_uncorrectable_errors))
+        with suppress(AttributeError):
+            print('  Endurance Indicator: {}% used'.format(devstat.percentage_used_endurance_indicator))
+        with suppress(AttributeError):
+            print('  Interface CRC Errors: {}'.format(devstat.number_of_interface_crc_errors))
+        with suppress(AttributeError):
+            print('  Mechanical Start Failures: {}'.format(devstat.number_of_mechanical_start_failures))
+    else:
+        print('Device stat: not supported')
+
+
+def main():
+    if len(sys.argv) != 2:
+        print('usage: poormon /dev/sdX')
+        sys.exit(0)
+    info = attempt_read_info_section(sys.argv[1])
+    data = attempt_read_data_section(sys.argv[1])
+    devstat = attempt_read_devstat(sys.argv[1])
+    show(info, data, devstat)
+
+
+if __name__ == '__main__':
+    main()
