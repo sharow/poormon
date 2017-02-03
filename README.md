@@ -46,7 +46,8 @@ SMART:
   198: Uncorrectable Sector Count    : 0
 Device stat: not supported
 ```
-this one isn't. and `Command Timeout: 2`, I need to watch out.
+this one isn't.<br>
+and `Command Timeout: 2`, I need to watch out.
 
 #### TOSHIBA Consumer Grade SSD
 ```
